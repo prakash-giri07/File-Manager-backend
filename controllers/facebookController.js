@@ -4,165 +4,134 @@ dotenv.config();
 
 // ================= ENV =================
 const GRAPH_API_VERSION = process.env.FB_API_VERSION || "v24.0";
+const USER_ACCESS_TOKEN = process.env.USER_ACCESS_TOKEN;
 
-let PAGE_ACCESS_TOKEN = process.env.INITIAL_PAGE_TOKEN || null;
-let USER_ACCESS_TOKEN = process.env.USER_ACCESS_TOKEN;
-let TOKEN_EXPIRY = null;
+// ================= HELPER: PAGINATION =================
+async function fetchAllPages(url, params) {
+  let allData = [];
+  let nextUrl = url;
 
-const APP_ID = process.env.FB_APP_ID;
-const APP_SECRET = process.env.FB_APP_SECRET;
-const AD_ACCOUNT_ID = process.env.FB_AD_ACCOUNT_ID;
+  while (nextUrl) {
+    const response = await axios.get(nextUrl, {
+      params: nextUrl === url ? params : {},
+    });
 
-console.log(APP_ID);
-
-// ================= TOKEN SYSTEM =================
-function isTokenExpired() {
-  if (!TOKEN_EXPIRY) return true;
-  return Date.now() >= TOKEN_EXPIRY;
-}
-
-async function refreshPageAccessToken() {
-  try {
-    const longUserResponse = await axios.get(
-      `https://graph.facebook.com/${GRAPH_API_VERSION}/oauth/access_token`,
-      {
-        params: {
-          grant_type: "fb_exchange_token",
-          client_id: APP_ID,
-          client_secret: APP_SECRET,
-          fb_exchange_token: USER_ACCESS_TOKEN,
-        },
-      },
-    );
-
-    const longUserToken = longUserResponse.data.access_token;
-
-    const pageResponse = await axios.get(
-      `https://graph.facebook.com/${GRAPH_API_VERSION}/me/accounts`,
-      {
-        params: { access_token: longUserToken },
-      },
-    );
-
-    const pages = pageResponse.data.data;
-
-    if (!pages || pages.length === 0) {
-      throw new Error("No Facebook pages found");
-    }
-
-    PAGE_ACCESS_TOKEN = pages[0].access_token;
-
-    TOKEN_EXPIRY = Date.now() + 50 * 24 * 60 * 60 * 1000;
-    console.log(PAGE_ACCESS_TOKEN);
-  } catch (error) {
-    console.error(
-      "Token refresh failed:",
-      error.response?.data || error.message,
-    );
-    throw new Error("Token refresh failed");
+    allData = [...allData, ...response.data.data];
+    nextUrl = response.data.paging?.next || null;
   }
+
+  return allData;
 }
 
-async function withValidToken(fn) {
+const getCampaigns = async (id) => {
   try {
-    if (!PAGE_ACCESS_TOKEN || isTokenExpired()) {
-      await refreshPageAccessToken();
-    }
-    return await fn(PAGE_ACCESS_TOKEN);
-  } catch (error) {
-    console.error("Token wrapper error:", error.message);
-    throw error;
-  }
-}
-
-// ================= FETCH CAMPAIGNS =================
-async function fetchCampaignInsights(startDate, endDate) {
-  return withValidToken(async (token) => {
-    if (!AD_ACCOUNT_ID) {
-      throw new Error("Missing FB_AD_ACCOUNT_ID");
+    if (!USER_ACCESS_TOKEN) {
+      throw new Error("Missing USER_ACCESS_TOKEN");
     }
 
-    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/act_${AD_ACCOUNT_ID}/insights`;
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${id}/campaigns`;
 
     const params = {
-      access_token: token,
-      fields: "campaign_name,spend,clicks,ctr,cpc,date_start",
+      access_token: USER_ACCESS_TOKEN,
+      fields: "id,name,status,lifetime_budget,daily_budget",
+      limit: 100,
     };
 
-    if (startDate && endDate) {
-      params.time_range = {
-        since: startDate,
-        until: endDate,
-      };
-    } else {
-      params.date_preset = "last_7d";
-    }
+    const accounts = await fetchAllPages(url, params);
 
-    const response = await axios.get(url, { params });
-
-    return (response.data.data || []).map((item, index) => ({
-      id: index + 1,
-      campaign: item.campaign_name,
-      spend: Number(item.spend || 0),
-      clicks: Number(item.clicks || 0),
-      ctr: Number(item.ctr || 0),
-      cpc: Number(item.cpc || 0),
-      date: item.date_start,
-    }));
-  });
-}
-
-// ================= API: CAMPAIGNS =================
-export const getCampaigns = async (req, res) => {
-  try {
-    const { campaign, startDate, endDate } = req.query;
-
-    let campaigns = await fetchCampaignInsights(startDate, endDate);
-
-    if (campaign) {
-      campaigns = campaigns.filter((c) => c.campaign === campaign);
-    }
-
-    res.json(campaigns);
+    return {
+      success: true,
+      total: accounts.length,
+      data: accounts,
+    };
   } catch (error) {
-    console.error("Campaign error:", error.message);
-    res.status(500).json({
-      message: "Error fetching campaigns",
-    });
+    console.error(
+      "E2 Ad Accounts error:",
+      error.response?.data || error.message,
+    );
+
+    return {
+      success: false,
+      message: "Error fetching ad accounts",
+      error: error.response?.data || error.message,
+    };
   }
 };
 
-// ================= API: KPI =================
-export const getKPI = async (req, res) => {
+const getBudget = async (id) => {
   try {
-    const { campaign, startDate, endDate } = req.query;
-
-    let campaigns = await fetchCampaignInsights(startDate, endDate);
-
-    if (campaign) {
-      campaigns = campaigns.filter((c) => c.campaign === campaign);
+    if (!USER_ACCESS_TOKEN) {
+      throw new Error("Missing USER_ACCESS_TOKEN");
     }
 
-    const totalSpend = campaigns.reduce((sum, c) => sum + c.spend, 0);
-    const totalClicks = campaigns.reduce((sum, c) => sum + c.clicks, 0);
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
-    const avgCTR =
-      campaigns.length > 0
-        ? campaigns.reduce((sum, c) => sum + c.ctr, 0) / campaigns.length
-        : 0;
+    const accounts = await axios.get(
+      `${url}/${id}?fields=insights%2Cname&access_token=${USER_ACCESS_TOKEN}`,
+    );
 
-    const avgCPC = totalClicks > 0 ? totalSpend / totalClicks : 0;
-
-    res.json({
-      spend: Math.round(totalSpend),
-      clicks: totalClicks,
-      ctr: Number(avgCTR.toFixed(2)),
-      cpc: Number(avgCPC.toFixed(2)),
-    });
+    return accounts.data;
   } catch (error) {
-    console.error("KPI error:", error.message);
+    console.error(
+      "E3 Ad Accounts error:",
+      error.response?.data || error.message,
+    );
+
+    return {
+      success: false,
+      message: "Error fetching ad accounts",
+      error: error.response?.data || error.message,
+    };
+  }
+};
+
+// ================= API: GET AD ACCOUNTS =================
+export const getAdAccounts = async (req, res) => {
+  try {
+    if (!USER_ACCESS_TOKEN) {
+      throw new Error("Missing USER_ACCESS_TOKEN");
+    }
+
+    const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/me/adaccounts`;
+
+    const params = {
+      access_token: USER_ACCESS_TOKEN,
+      fields: "id,name,account_status,currency,timezone_name",
+      limit: 100,
+    };
+
+    const accounts = await fetchAllPages(url, params);
+
+    let finalTurnover = [];
+
+    await Promise.all(
+      accounts.map(async (current_add_account, key) => {
+        let getAllCampaign = await getCampaigns(current_add_account.id);
+        let campaigns = getAllCampaign.data;
+        let AllCampaignBudgets = [];
+        await Promise.all(
+          campaigns.map(async (current_campaign, key) => {
+            let getBudgetofCampaign = await getBudget(current_campaign.id);
+            AllCampaignBudgets.push(getBudgetofCampaign);
+          }),
+        );
+        let myAddAccountData = current_add_account;
+        myAddAccountData["campaigns"] = AllCampaignBudgets;
+        return finalTurnover.push(myAddAccountData);
+      }),
+    );
+
+    res.json(finalTurnover);
+  } catch (error) {
+    console.error(
+      " E1 Ad Accounts error:",
+      error.response?.data || error.message,
+    );
+
     res.status(500).json({
-      message: "Error fetching KPI",
+      success: false,
+      message: "Error fetching ad accounts",
+      error: error.response?.data || error.message,
     });
   }
 };
